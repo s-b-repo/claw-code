@@ -371,11 +371,41 @@ fn read_credentials_root(path: &PathBuf) -> io::Result<Map<String, Value>> {
 fn write_credentials_root(path: &PathBuf, root: &Map<String, Value>) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort tighten-parent: if the directory already exists
+            // with looser perms leave it alone (user may have intentionally
+            // relaxed it), but on fresh creation we own it so mode 0700 is
+            // correct.
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
     let rendered = serde_json::to_string_pretty(&Value::Object(root.clone()))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, format!("{rendered}\n"))?;
+
+    // Write the token file with mode 0600 from creation — never let it exist
+    // world-readable even briefly between write and chmod.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        file.write_all(rendered.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&temp_path, format!("{rendered}\n"))?;
+    }
+
     fs::rename(temp_path, path)
 }
 

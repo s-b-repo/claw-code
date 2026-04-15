@@ -1048,20 +1048,20 @@ fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
 
 fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
+        .and_then(permission_mode_from_label)
         .ok_or_else(|| {
             format!(
                 "unsupported permission mode '{value}'. Use read-only, workspace-write, or danger-full-access."
             )
         })
-        .map(permission_mode_from_label)
 }
 
-fn permission_mode_from_label(mode: &str) -> PermissionMode {
+fn permission_mode_from_label(mode: &str) -> Option<PermissionMode> {
     match mode {
-        "read-only" => PermissionMode::ReadOnly,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        other => panic!("unsupported permission mode label: {other}"),
+        "read-only" => Some(PermissionMode::ReadOnly),
+        "workspace-write" => Some(PermissionMode::WorkspaceWrite),
+        "danger-full-access" => Some(PermissionMode::DangerFullAccess),
+        _ => None,
     }
 }
 
@@ -1074,13 +1074,30 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
 }
 
 fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
-        .ok()
-        .as_deref()
-        .and_then(normalize_permission_mode)
-        .map(permission_mode_from_label)
-        .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
+    if let Some(raw) = env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok() {
+        if let Some(normalized) = normalize_permission_mode(raw.as_str()) {
+            if let Some(mode) = permission_mode_from_label(normalized) {
+                // Surface the override so an unattended claw session cannot
+                // silently escalate to full-system access via a spoofed
+                // environment variable. Suppressed during tests and the
+                // non-interactive JSON output path.
+                if io::stderr().is_terminal() {
+                    eprintln!(
+                        "claw: permission mode overridden by RUSTY_CLAUDE_PERMISSION_MODE={normalized}"
+                    );
+                }
+                return mode;
+            }
+            eprintln!(
+                "claw: ignoring RUSTY_CLAUDE_PERMISSION_MODE={raw:?} — not a known permission label"
+            );
+        } else {
+            eprintln!(
+                "claw: ignoring RUSTY_CLAUDE_PERMISSION_MODE={raw:?} — not a known permission label"
+            );
+        }
+    }
+    config_permission_mode_for_current_dir().unwrap_or(PermissionMode::DangerFullAccess)
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -4180,7 +4197,9 @@ impl LiveCli {
 
         let previous = self.permission_mode.as_str().to_string();
         let session = self.runtime.session().clone();
-        self.permission_mode = permission_mode_from_label(normalized);
+        self.permission_mode = permission_mode_from_label(normalized).ok_or_else(|| {
+            format!("unsupported permission mode '{normalized}' — reject or upgrade this code path")
+        })?;
         let runtime = build_runtime(
             session,
             &self.session.id,

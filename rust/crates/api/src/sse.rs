@@ -1,6 +1,12 @@
 use crate::error::ApiError;
 use crate::types::StreamEvent;
 
+/// Maximum number of bytes the SSE parser will buffer waiting for a frame
+/// separator. A well-behaved upstream emits `\n\n` every few kB; if we
+/// accumulate past this cap something is wrong (broken upstream, hostile
+/// peer, or a truncated encoding) and we fail closed instead of OOMing.
+const MAX_SSE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
@@ -26,6 +32,11 @@ impl SseParser {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ApiError> {
+        if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER_BYTES {
+            return Err(ApiError::InvalidSseFrame(
+                "SSE buffer exceeded maximum size waiting for a frame separator",
+            ));
+        }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 

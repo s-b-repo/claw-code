@@ -462,10 +462,17 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
         return Ok(vec![base_path.to_path_buf()]);
     }
 
+    // Never follow symlinks — a symlink pointing at `/proc/self/mem` or a
+    // sibling directory outside the search root must not be read. We also
+    // refuse to descend into symlinked directories for the same reason.
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    for entry in WalkDir::new(base_path).follow_links(false) {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_file() {
             files.push(entry.path().to_path_buf());
         }
     }
@@ -566,7 +573,6 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 }
 
 /// Read a file with workspace boundary enforcement.
-#[allow(dead_code)]
 pub fn read_file_in_workspace(
     path: &str,
     offset: Option<usize>,
@@ -582,7 +588,6 @@ pub fn read_file_in_workspace(
 }
 
 /// Write a file with workspace boundary enforcement.
-#[allow(dead_code)]
 pub fn write_file_in_workspace(
     path: &str,
     content: &str,
@@ -597,7 +602,6 @@ pub fn write_file_in_workspace(
 }
 
 /// Edit a file with workspace boundary enforcement.
-#[allow(dead_code)]
 pub fn edit_file_in_workspace(
     path: &str,
     old_string: &str,

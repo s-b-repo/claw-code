@@ -267,6 +267,10 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
+        "grok-2" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        }),
         _ => None,
     }
 }

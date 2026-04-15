@@ -81,7 +81,20 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
+    // Reasonable defaults: a hung upstream cannot wedge claw forever.
+    //
+    // * `connect_timeout` is tight because TCP handshakes are bounded by a
+    //   few round-trips under any normal condition.
+    // * `timeout` is the outer ceiling for *non-streaming* requests; the
+    //   streaming code path builds a separate client with no total-request
+    //   timeout if it ever needs one (today all uses of this helper are
+    //   bounded HTTP + SSE events that trickle regularly enough not to
+    //   exceed it).
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
 
     let no_proxy = config
         .no_proxy
