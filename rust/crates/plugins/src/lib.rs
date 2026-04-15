@@ -349,7 +349,10 @@ impl PluginTool {
 }
 
 fn default_tool_permission_label() -> String {
-    "danger-full-access".to_string()
+    // Default plugin tools to read-only. Plugin authors must explicitly
+    // opt in to higher tiers via `requiredPermission` in the manifest;
+    // a missing or misspelled field must never grant full-system access.
+    "read-only".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -803,17 +806,35 @@ impl PluginRegistry {
     }
 
     pub fn aggregated_tools(&self) -> Result<Vec<PluginTool>, PluginError> {
+        // Names reserved by the host — a plugin that declares one of these
+        // would shadow or collide with the built-in implementation and is
+        // rejected at aggregation time rather than silently dropped or
+        // silently double-dispatched.
+        const RESERVED_TOOL_NAMES: &[&str] = &[
+            "bash", "read_file", "write_file", "edit_file", "glob_search", "grep_search",
+            "WebFetch", "WebSearch", "Agent", "Skill", "TodoWrite", "TaskCreate", "TaskList",
+            "TaskGet", "TaskUpdate", "TaskStop", "TaskOutput", "NotebookEdit", "REPL",
+            "PowerShell", "Sleep", "Config", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion",
+            "StructuredOutput", "ToolSearch", "SendUserMessage", "Brief",
+        ];
+
         let mut tools = Vec::new();
         let mut seen_names = BTreeMap::new();
         for plugin in self.plugins.iter().filter(|plugin| plugin.is_enabled()) {
             plugin.validate()?;
             for tool in plugin.tools() {
+                let name = &tool.definition().name;
+                if RESERVED_TOOL_NAMES.iter().any(|r| *r == name) {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin `{}` defines tool `{name}`, which is a reserved built-in name",
+                        tool.plugin_id()
+                    )));
+                }
                 if let Some(existing_plugin) =
-                    seen_names.insert(tool.definition().name.clone(), tool.plugin_id().to_string())
+                    seen_names.insert(name.clone(), tool.plugin_id().to_string())
                 {
                     return Err(PluginError::InvalidManifest(format!(
-                        "plugin tool `{}` is defined by both `{existing_plugin}` and `{}`",
-                        tool.definition().name,
+                        "plugin tool `{name}` is defined by both `{existing_plugin}` and `{}`",
                         tool.plugin_id()
                     )));
                 }
@@ -2068,8 +2089,18 @@ fn resolve_hook_entry(root: &Path, entry: &str) -> String {
     }
 }
 
+/// True when `entry` looks like a bare program name safe to hand to a
+/// shell (`python3`, `node`, `ruby`). Anything with whitespace, shell
+/// metacharacters, or path separators is refused so plugin manifests
+/// cannot smuggle `rm -rf /` through the "skip path validation" branch.
 fn is_literal_command(entry: &str) -> bool {
-    !entry.starts_with("./") && !entry.starts_with("../") && !Path::new(entry).is_absolute()
+    if entry.starts_with("./") || entry.starts_with("../") || Path::new(entry).is_absolute() {
+        return false;
+    }
+    !entry.is_empty()
+        && entry
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn run_lifecycle_commands(
@@ -2138,21 +2169,39 @@ fn resolve_local_source(source: &str) -> Result<PathBuf, PluginError> {
 }
 
 fn parse_install_source(source: &str) -> Result<PluginInstallSource, PluginError> {
-    if source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("git@")
-        || Path::new(source)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
-    {
-        Ok(PluginInstallSource::GitUrl {
-            url: source.to_string(),
-        })
-    } else {
-        Ok(PluginInstallSource::LocalPath {
-            path: resolve_local_source(source)?,
-        })
+    // Restrict remote install URLs to https. Plain http risks MITM on an
+    // unsigned git clone, and `git@host:…` / `ssh://` triggers outbound SSH
+    // with the user's key against an arbitrary endpoint — never what the
+    // user means when pasting a URL into `/plugin install`.
+    let trimmed = source.trim();
+    if trimmed.starts_with("https://") {
+        return Ok(PluginInstallSource::GitUrl {
+            url: trimmed.to_string(),
+        });
     }
+
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("git@")
+        || trimmed.starts_with("ssh://")
+        || trimmed.starts_with("git+")
+    {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin install URL `{trimmed}` uses an unsupported scheme; only https:// is allowed"
+        )));
+    }
+
+    if Path::new(trimmed)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
+    {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin install source `{trimmed}` looks like a bare git URL; rewrite as https://…"
+        )));
+    }
+
+    Ok(PluginInstallSource::LocalPath {
+        path: resolve_local_source(trimmed)?,
+    })
 }
 
 fn materialize_source(

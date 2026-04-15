@@ -249,7 +249,22 @@ impl JsonlTelemetrySink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // Telemetry traces can contain file paths, model names, and HTTP
+        // attributes that include sensitive project state; keep them
+        // owner-readable only.
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)?
+        };
+        #[cfg(not(unix))]
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -271,8 +286,16 @@ impl TelemetrySink for JsonlTelemetrySink {
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
+        // Best-effort: if writing fails (disk full, filesystem gone), log
+        // to stderr once per record rather than discarding silently so
+        // infra problems don't disappear into a hole.
+        if let Err(error) = writeln!(file, "{line}") {
+            eprintln!("telemetry: failed to record event: {error}");
+            return;
+        }
+        if let Err(error) = file.flush() {
+            eprintln!("telemetry: failed to flush event: {error}");
+        }
     }
 }
 

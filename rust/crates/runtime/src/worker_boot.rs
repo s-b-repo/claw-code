@@ -643,8 +643,20 @@ fn emit_state_file(worker: &Worker) {
     };
 
     if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-        let _ = std::fs::write(&tmp_path, json);
-        let _ = std::fs::rename(&tmp_path, &state_path);
+        // Surface infra problems instead of silently serving stale state.
+        if let Err(error) = std::fs::write(&tmp_path, json) {
+            eprintln!(
+                "worker_boot: failed to write state snapshot {:?}: {error}",
+                tmp_path
+            );
+            return;
+        }
+        if let Err(error) = std::fs::rename(&tmp_path, &state_path) {
+            eprintln!(
+                "worker_boot: failed to rename state snapshot {:?} -> {:?}: {error}",
+                tmp_path, state_path
+            );
+        }
     }
 }
 

@@ -487,36 +487,45 @@ impl AnthropicClient {
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
-        // Always run the local byte-estimate guard first. This catches
-        // oversized requests even if the remote count_tokens endpoint is
-        // unreachable, misconfigured, or unimplemented (e.g., third-party
-        // Anthropic-compatible gateways). If byte estimation already flags
-        // the request as oversized, reject immediately without a network
-        // round trip.
-        super::preflight_message_request(request)?;
-
         let Some(limit) = model_token_limit(&request.model) else {
-            return Ok(());
+            // Unknown model: no context-window guard to enforce. Run the
+            // base byte check for consistency with other providers.
+            return super::preflight_message_request(request);
         };
 
-        // Best-effort refinement using the Anthropic count_tokens endpoint.
-        // On any failure (network, parse, auth), fall back to the local
-        // byte-estimate result which already passed above.
-        let Ok(counted_input_tokens) = self.count_tokens(request).await else {
-            return Ok(());
+        // Fast path: the local byte estimate is cheap and conservative. If
+        // it already says the request fits comfortably, skip the network
+        // round trip. Only when the byte estimate flags the request as
+        // oversized do we consult the authoritative Anthropic count_tokens
+        // endpoint to rescue false positives -- the byte estimator
+        // wildly overestimates JSON-heavy payloads (tool schemas, system
+        // prompts) and would otherwise reject legitimate requests before
+        // the real tokenizer ever gets a look.
+        let byte_preflight_error = match super::preflight_message_request(request) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
         };
-        let estimated_total_tokens = counted_input_tokens.saturating_add(request.max_tokens);
-        if estimated_total_tokens > limit.context_window_tokens {
-            return Err(ApiError::ContextWindowExceeded {
-                model: resolve_model_alias(&request.model),
-                estimated_input_tokens: counted_input_tokens,
-                requested_output_tokens: request.max_tokens,
-                estimated_total_tokens,
-                context_window_tokens: limit.context_window_tokens,
-            });
+
+        match self.count_tokens(request).await {
+            Ok(counted_input_tokens) => {
+                let estimated_total_tokens =
+                    counted_input_tokens.saturating_add(request.max_tokens);
+                if estimated_total_tokens > limit.context_window_tokens {
+                    return Err(ApiError::ContextWindowExceeded {
+                        model: resolve_model_alias(&request.model),
+                        estimated_input_tokens: counted_input_tokens,
+                        requested_output_tokens: request.max_tokens,
+                        estimated_total_tokens,
+                        context_window_tokens: limit.context_window_tokens,
+                    });
+                }
+                Ok(())
+            }
+            // count_tokens unreachable, unimplemented (third-party
+            // Anthropic-compatible gateways), or returned an unparseable
+            // body: trust the byte estimate as a final fallback.
+            Err(_) => Err(byte_preflight_error),
         }
-
-        Ok(())
     }
 
     async fn count_tokens(&self, request: &MessageRequest) -> Result<u32, ApiError> {
@@ -649,15 +658,22 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 }
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
-    Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+    if read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
+    {
+        return Ok(true);
+    }
+    // A saved OAuth token (from `claude login`) also counts — callers asked
+    // "do we have *any* credentials to start with", not just env vars.
+    Ok(load_saved_oauth_token()?.is_some())
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
-    let _ = load_oauth_config;
+    // Env vars take precedence so callers can force a specific key without
+    // deleting their saved login.
     if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
         return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
@@ -670,6 +686,22 @@ where
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
     }
+
+    // Fall back to the persisted OAuth token written by `claude login`.
+    // The caller supplies the OAuth client config (client id, redirect URI,
+    // token URL) so we can refresh the access token if it has expired.
+    if let Some(config) = load_oauth_config()? {
+        if let Some(token_set) = resolve_saved_oauth_token(&config)? {
+            return Ok(AuthSource::BearerToken(token_set.access_token));
+        }
+    } else if let Some(token_set) = load_saved_oauth_token()? {
+        // No OAuth config provided — we cannot refresh, but if the token is
+        // still within its lifetime we can at least use it as-is.
+        if !oauth_token_is_expired(&token_set) {
+            return Ok(AuthSource::BearerToken(token_set.access_token));
+        }
+    }
+
     Err(anthropic_missing_credentials())
 }
 
@@ -889,7 +921,10 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+    // 409 intentionally excluded: Conflict is a semantic failure (duplicate
+    // request id, optimistic concurrency violation, etc.) — retrying burns
+    // the whole budget without ever succeeding.
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header
@@ -1218,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_startup_auth_source_ignores_saved_oauth_without_loading_config() {
+    fn resolve_startup_auth_source_uses_saved_oauth_when_env_missing() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
@@ -1232,9 +1267,17 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let error = resolve_startup_auth_source(|| panic!("config should not be loaded"))
-            .expect_err("saved oauth should be ignored");
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        // With env vars cleared and a valid (unexpired) saved OAuth token,
+        // `resolve_startup_auth_source` must hand back the saved token as
+        // a Bearer credential. Before the fix, the loader closure was
+        // discarded and users with an OAuth-only login got
+        // `MissingCredentials` on every startup.
+        let auth = resolve_startup_auth_source(|| Ok(None))
+            .expect("saved oauth token should be returned when env vars are empty");
+        match auth {
+            AuthSource::BearerToken(token) => assert_eq!(token, "saved-access-token"),
+            other => panic!("expected BearerToken from saved OAuth, got {other:?}"),
+        }
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAW_CONFIG_HOME");

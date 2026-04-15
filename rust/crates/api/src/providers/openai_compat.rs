@@ -399,6 +399,14 @@ impl OpenAiSseParser {
     }
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
+        // Mirror sse.rs: fail closed if an upstream streams indefinitely
+        // without emitting a frame separator instead of OOMing the process.
+        const MAX_SSE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+        if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER_BYTES {
+            return Err(ApiError::InvalidSseFrame(
+                "OpenAI-compat SSE buffer exceeded maximum size waiting for a frame separator",
+            ));
+        }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
@@ -1258,7 +1266,9 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+    // 409 intentionally excluded: Conflict is a semantic failure, not a
+    // transient one — retrying never resolves the conflict.
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 fn normalize_finish_reason(value: &str) -> String {

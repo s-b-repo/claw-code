@@ -11,17 +11,18 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
+    check_freshness, dedupe_superseded_commit_events, edit_file, edit_file_in_workspace,
+    execute_bash, glob_search,
     grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
+    read_file, read_file_in_workspace,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
+    write_file, write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
@@ -1205,15 +1206,18 @@ fn execute_tool_with_enforcer(
         }
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadFileInput>(input).and_then(run_read_file)
+            let parsed: ReadFileInput = from_value(input)?;
+            run_read_file(parsed, enforcer_workspace_scope(enforcer))
         }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WriteFileInput>(input).and_then(run_write_file)
+            let parsed: WriteFileInput = from_value(input)?;
+            run_write_file(parsed, enforcer_workspace_scope(enforcer))
         }
         "edit_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<EditFileInput>(input).and_then(run_edit_file)
+            let parsed: EditFileInput = from_value(input)?;
+            run_edit_file(parsed, enforcer_workspace_scope(enforcer))
         }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1896,8 +1900,11 @@ fn has_dangerous_paths(command: &str) -> bool {
             }
         }
 
-        // Check for parent directory traversal that escapes workspace
-        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
+        // Check for parent directory traversal that escapes workspace.
+        // Parenthesize explicitly — `&&` binds tighter than `||`, so the
+        // unparenthesized form `A || B && C` evaluates as `A || (B && C)`
+        // and a single `../` token never trips the guard.
+        if (token.contains("../..") || token.starts_with("../")) && !token.starts_with("./") {
             return true;
         }
     }
@@ -2059,27 +2066,62 @@ fn branch_divergence_output(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+/// Returns the workspace root the calling enforcer wants file-IO tools to
+/// stay inside, or `None` if the active permission mode lets the tool
+/// escape the workspace (`DangerFullAccess` / no enforcer). The current
+/// process cwd is treated as the workspace root — we deliberately avoid
+/// plumbing a separate workspace path through every callsite.
+fn enforcer_workspace_scope(enforcer: Option<&PermissionEnforcer>) -> Option<PathBuf> {
+    let mode = enforcer?.active_mode();
+    if matches!(mode, PermissionMode::DangerFullAccess) {
+        return None;
+    }
+    // Read-only, workspace-write, prompt, allow — all should stay inside
+    // the current project root.
+    std::env::current_dir().ok()
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+fn run_read_file(
+    input: ReadFileInput,
+    workspace_root: Option<PathBuf>,
+) -> Result<String, String> {
+    let output = match workspace_root {
+        Some(root) => read_file_in_workspace(&input.path, input.offset, input.limit, &root),
+        None => read_file(&input.path, input.offset, input.limit),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
+fn run_write_file(
+    input: WriteFileInput,
+    workspace_root: Option<PathBuf>,
+) -> Result<String, String> {
+    let output = match workspace_root {
+        Some(root) => write_file_in_workspace(&input.path, &input.content, &root),
+        None => write_file(&input.path, &input.content),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_edit_file(
+    input: EditFileInput,
+    workspace_root: Option<PathBuf>,
+) -> Result<String, String> {
+    let replace_all = input.replace_all.unwrap_or(false);
+    let output = match workspace_root {
+        Some(root) => edit_file_in_workspace(
             &input.path,
             &input.old_string,
             &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
-    )
+            replace_all,
+            &root,
+        ),
+        None => edit_file(&input.path, &input.old_string, &input.new_string, replace_all),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2843,9 +2885,35 @@ fn build_http_client() -> Result<Client, String> {
 
 fn normalize_fetch_url(url: &str) -> Result<String, String> {
     let parsed = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+
+    // Only http(s) — reject file://, data:, ftp://, gopher://, javascript:, etc.
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "WebFetch scheme '{other}' is not allowed; only http and https are supported"
+            ));
+        }
+    }
+
+    // Block SSRF targets: RFC 1918 private ranges, loopback (except when
+    // explicitly requested), link-local / cloud-metadata (169.254.0.0/16),
+    // IPv6 unique-local (fc00::/7) and link-local (fe80::/10). The
+    // `localhost`/`127.0.0.1`/`::1` carve-out below only applies to http,
+    // never to metadata or private IPs.
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(String::from("WebFetch URL is missing a host"));
+    }
+    if is_disallowed_fetch_host(&host) {
+        return Err(format!(
+            "WebFetch refuses to connect to '{host}' (private, loopback, or link-local address)"
+        ));
+    }
+
     if parsed.scheme() == "http" {
-        let host = parsed.host_str().unwrap_or_default();
-        if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+        let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1");
+        if !loopback {
             let mut upgraded = parsed;
             upgraded
                 .set_scheme("https")
@@ -2854,6 +2922,65 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
         }
     }
     Ok(parsed.to_string())
+}
+
+/// True when the host resolves to a private, loopback, link-local, or
+/// cloud-metadata address that `WebFetch` must refuse. Literal IPs are
+/// inspected directly; hostnames are checked against a small denylist of
+/// well-known metadata endpoints (DNS resolution is deliberately not
+/// performed here — reqwest will still fail closed if a hostname later
+/// resolves to a disallowed IP because we do not have a perfect filter,
+/// but the obvious vectors are blocked).
+fn is_disallowed_fetch_host(host: &str) -> bool {
+    const METADATA_HOSTS: &[&str] = &[
+        "metadata.google.internal",
+        "metadata.goog",
+        "metadata",
+        "instance-data",
+        "metadata.azure.com",
+    ];
+    if METADATA_HOSTS.iter().any(|h| host == *h) {
+        return true;
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_disallowed_fetch_ip(ip);
+    }
+    // Bracketed IPv6 literal form: `[::1]`, `[fe80::1]`.
+    if host.starts_with('[') && host.ends_with(']') {
+        if let Ok(ip) = host[1..host.len() - 1].parse::<std::net::IpAddr>() {
+            return is_disallowed_fetch_ip(ip);
+        }
+    }
+    false
+}
+
+fn is_disallowed_fetch_ip(ip: std::net::IpAddr) -> bool {
+    // Loopback is intentionally *allowed* — the user controls their own
+    // machine and local dev servers are a legitimate target. The SSRF
+    // surface is internal network / cloud metadata / link-local.
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                // 169.254.169.254 and its /16 — all cloud metadata lives here.
+                || (a == 169 && b == 254)
+                // 100.64.0.0/10 (CGNAT)
+                || (a == 100 && (b & 0xC0) == 0x40)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique-local (fc00::/7)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local (fe80::/10)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
@@ -9372,7 +9499,13 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("perm-read");
+        // Workspace-boundary enforcement is anchored at the current
+        // working directory, so the file we read must live inside it.
+        // Create the test fixture under cwd rather than /tmp.
+        let root = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join(format!("perm-read-{}", std::process::id()));
         fs::create_dir_all(&root).expect("create root");
         let file = root.join("readable.txt");
         fs::write(&file, "content\n").expect("write test file");

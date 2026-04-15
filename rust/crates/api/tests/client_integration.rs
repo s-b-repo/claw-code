@@ -106,9 +106,17 @@ async fn send_message_posts_json_and_parses_response() {
 #[tokio::test]
 async fn send_message_blocks_oversized_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    // Byte estimate will flag the request as oversized. The Anthropic
+    // preflight then consults count_tokens as the authoritative source;
+    // answer with an honest token count that still exceeds the window so
+    // the request is rejected before /v1/messages is ever called.
     let server = spawn_server(
         state.clone(),
-        vec![http_response("200 OK", "application/json", "{}")],
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            "{\"input_tokens\":180000}",
+        )],
     )
     .await;
 
@@ -130,12 +138,16 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
             ..Default::default()
         })
         .await
-        .expect_err("oversized request should fail local context-window preflight");
+        .expect_err("oversized request should fail context-window preflight");
 
     assert!(matches!(error, ApiError::ContextWindowExceeded { .. }));
+    let captured = state.lock().await;
     assert!(
-        state.lock().await.is_empty(),
-        "preflight failure should avoid any upstream HTTP request"
+        captured
+            .iter()
+            .all(|request| request.path != "/v1/messages"),
+        "preflight failure should never reach /v1/messages, got {:?}",
+        captured.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
 }
 
